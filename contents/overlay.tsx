@@ -551,24 +551,25 @@ export default function Overlay() {
       return null
     }
 
-    const main = document.querySelector("main") as HTMLElement | null
-    if (main) {
-      const prevTop = main.scrollTop
-      main.scrollTop = main.scrollHeight
-      await new Promise((r) => setTimeout(r, 90))
-      main.scrollTop = prevTop
-      await new Promise((r) => setTimeout(r, 60))
-    }
-
     const getUserEls = () =>
       Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'))
 
+    const main = document.querySelector("main") as HTMLElement | null
+
+    // 先尝试直接获取 target
     let target = getUserEls()[idx] || null
 
+    // 如果找不到，滚动到底部加载更多内容
     if (!target && main) {
+      const prevTop = main.scrollTop
       main.scrollTop = main.scrollHeight
       await new Promise((r) => setTimeout(r, 140))
       target = getUserEls()[idx] || null
+      // 恢复滚动位置（如果还是找不到）
+      if (!target) {
+        main.scrollTop = prevTop
+        return
+      }
     }
 
     if (!target) return
@@ -1617,7 +1618,6 @@ export default function Overlay() {
         <div className="tc-top">
           <div style={{ display: "flex", gap: 10, alignItems: "baseline", minWidth: 0 }}>
             <div style={{ fontWeight: 900 }}>TreeChat</div>
-            <div style={{ fontSize: 12, opacity: 0.75, whiteSpace: "nowrap" }}></div>
           </div>
 
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
