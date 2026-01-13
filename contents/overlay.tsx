@@ -55,6 +55,10 @@ type TreeState = {
 }
 
 const ROOT_ID = "root"
+const SAVE_TREE_DELAY_MS = 180
+const SAVE_SCROLL_DELAY_MS = 120
+const REFRESH_RETRY_DELAY_MS = 90
+const URL_CHECK_INTERVAL_MS = 700
 
 /* ================= ✅ Persist ================= */
 
@@ -81,8 +85,7 @@ function safeJsonParse<T>(s: string | null): T | null {
 function loadTree(convoKey: string): TreeState | null {
   const st = safeJsonParse<TreeState>(localStorage.getItem(storageKey(convoKey)))
   if (!st) return null
-  if (!st.collapsedIds) (st as any).collapsedIds = {}
-  return st
+  return { ...st, collapsedIds: st.collapsedIds ?? {} }
 }
 
 function stripTreeForPersist(st: TreeState): TreeState {
@@ -151,6 +154,25 @@ function getConversationKey() {
   return m ? `c_${m[1]}` : location.pathname
 }
 
+function getMainElement(): HTMLElement | null {
+  return document.querySelector("main") as HTMLElement | null
+}
+
+function resolveMessageObserverRoot(): HTMLElement {
+  const main = getMainElement() ?? document.body
+  const first = main.querySelector<HTMLElement>("[data-message-author-role]")
+  if (!first) return main
+
+  let best: HTMLElement = main
+  let node = first.parentElement as HTMLElement | null
+  while (node && node !== main) {
+    const count = node.querySelectorAll("[data-message-author-role]").length
+    if (count >= 2) best = node
+    node = node.parentElement as HTMLElement | null
+  }
+  return best
+}
+
 /* ================= DOM extract ================= */
 
 function uniqueTopLevelRoleEls(root: HTMLElement): HTMLElement[] {
@@ -159,17 +181,15 @@ function uniqueTopLevelRoleEls(root: HTMLElement): HTMLElement[] {
 }
 
 function extractMessages(): Msg[] {
-  const main = document.querySelector("main") as HTMLElement | null
-  const root = main ?? document.body
+  const root = getMainElement() ?? document.body
   const els = uniqueTopLevelRoleEls(root)
-
   const out: Msg[] = []
   for (const el of els) {
     const roleRaw = el.getAttribute("data-message-author-role")
     const role = roleRaw === "user" ? "user" : roleRaw === "assistant" ? "assistant" : null
     if (!role) continue
 
-    const text = cleanText(el.innerText)
+    const text = cleanText(el.textContent || el.innerText || "")
     const html = (el.innerHTML || "").trim()
     if (!text && !html) continue
 
@@ -515,7 +535,7 @@ export default function Overlay() {
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current)
     saveTimerRef.current = window.setTimeout(() => {
       saveTree(stripTreeForPersist(tree))
-    }, 180)
+    }, SAVE_TREE_DELAY_MS)
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current)
       saveTimerRef.current = null
@@ -525,7 +545,7 @@ export default function Overlay() {
   /* ---------- render helpers ---------- */
 
   const forceRenderChatGPT = () => {
-    const main = document.querySelector("main") as HTMLElement | null
+    const main = getMainElement()
     if (!main) return
     const prevTop = main.scrollTop
     main.scrollTop = main.scrollHeight
@@ -554,7 +574,7 @@ export default function Overlay() {
     const getUserEls = () =>
       Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'))
 
-    const main = document.querySelector("main") as HTMLElement | null
+    const main = getMainElement()
 
     // 先尝试直接获取 target
     let target = getUserEls()[idx] || null
@@ -618,8 +638,7 @@ export default function Overlay() {
   const [livePairsTick, setLivePairsTick] = useState(0)
   const livePairs = useMemo(() => {
     return pairMessages(extractMessages())
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [livePairsTick, tree.activeId])
+  }, [livePairsTick])
 
   const getLiveHtmlByIndex = (idx: number) => {
     const p = livePairs[idx]
@@ -675,7 +694,7 @@ export default function Overlay() {
               retryRef.current = 0
             }
           })
-        }, 90)
+        }, REFRESH_RETRY_DELAY_MS)
       }
       return
     }
@@ -693,6 +712,16 @@ export default function Overlay() {
     setTree(next)
   }
 
+  const refreshScheduledRef = useRef(false)
+  const scheduleRefresh = () => {
+    if (refreshScheduledRef.current) return
+    refreshScheduledRef.current = true
+    requestAnimationFrame(() => {
+      refreshScheduledRef.current = false
+      refresh()
+    })
+  }
+
   /* ================= ✅ Align button logic ================= */
 
   const [aligning, setAligning] = useState(false)
@@ -708,7 +737,7 @@ export default function Overlay() {
     setAligning(true)
 
     try {
-      const main = document.querySelector("main") as HTMLElement | null
+      const main = getMainElement()
       if (main) {
         const prevTop = main.scrollTop
         const steps = 10
@@ -760,27 +789,43 @@ export default function Overlay() {
     setLivePairsTick((x) => x + 1)
   }
 
+  const observerRef = useRef<MutationObserver | null>(null)
+  const observerRootRef = useRef<HTMLElement | null>(null)
+
   // 首次 + DOM 变化 + URL 变化
   useEffect(() => {
     refresh()
 
-    const main = document.querySelector("main") ?? document.body
-    const obs = new MutationObserver(() => {
-      refresh()
-    })
-    obs.observe(main, { childList: true, subtree: true, characterData: true })
+    const attachObserver = () => {
+      const root = resolveMessageObserverRoot()
+      observerRootRef.current = root
+
+      if (observerRef.current) observerRef.current.disconnect()
+      observerRef.current = new MutationObserver(() => {
+        scheduleRefresh()
+      })
+      observerRef.current.observe(root, { childList: true, subtree: true, characterData: true })
+    }
+
+    attachObserver()
 
     let lastUrl = location.href
     const t = window.setInterval(() => {
       if (location.href !== lastUrl) {
         lastUrl = location.href
         retryRef.current = 0
-        refresh()
+        scheduleRefresh()
+        attachObserver()
+        return
       }
-    }, 700)
+      const currentRoot = resolveMessageObserverRoot()
+      if (currentRoot !== observerRootRef.current) {
+        attachObserver()
+      }
+    }, URL_CHECK_INTERVAL_MS)
 
     return () => {
-      obs.disconnect()
+      if (observerRef.current) observerRef.current.disconnect()
       window.clearInterval(t)
       if (retryTimerRef.current) {
         window.clearTimeout(retryTimerRef.current)
@@ -868,7 +913,7 @@ export default function Overlay() {
         rightTop: right.scrollTop,
         rightLeft: right.scrollLeft
       })
-    }, 120)
+    }, SAVE_SCROLL_DELAY_MS)
   }
 
   useEffect(() => {
@@ -1150,27 +1195,26 @@ export default function Overlay() {
   const basePromptHeightRef = useRef<number | null>(null)
 
   const getPromptEl = (): HTMLElement | null => {
-    // ✅ 优先找“会变高的整体输入区/表单容器”
-    const form =
-      (document.querySelector("form:has([data-testid='prompt-textarea'])") as HTMLElement) ||
-      (document.querySelector("form:has(textarea)") as HTMLElement) ||
-      (document.querySelector("form:has([contenteditable='true'])") as HTMLElement)
+    const selectors = [
+      // 优先找“会变高的整体输入区/表单容器”
+      "form:has([data-testid='prompt-textarea'])",
+      "form:has(textarea)",
+      "form:has([contenteditable='true'])",
+      // contenteditable（新 UI 常见）
+      "[data-testid='prompt-textarea'][contenteditable='true']",
+      "[contenteditable='true']",
+      // textarea 兜底
+      "[data-testid='prompt-textarea']",
+      "textarea#prompt-textarea",
+      "form textarea",
+      "textarea"
+    ]
 
-    if (form) return form
-
-    // ✅ contenteditable（新 UI 常见）
-    const ce =
-      (document.querySelector("[data-testid='prompt-textarea'][contenteditable='true']") as HTMLElement) ||
-      (document.querySelector("[contenteditable='true']") as HTMLElement)
-    if (ce) return ce
-
-    // ✅ textarea 兜底
-    return (
-      (document.querySelector('[data-testid="prompt-textarea"]') as HTMLElement) ||
-      (document.querySelector("textarea#prompt-textarea") as HTMLElement) ||
-      (document.querySelector("form textarea") as HTMLElement) ||
-      (document.querySelector("textarea") as HTMLElement)
-    )
+    for (const selector of selectors) {
+      const el = document.querySelector(selector) as HTMLElement | null
+      if (el) return el
+    }
+    return null
   }
 
   useEffect(() => {
